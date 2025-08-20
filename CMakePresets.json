@@ -1,0 +1,52 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "vcpkg",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}\\scripts\\buildsystems\\vcpkg.cmake",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/output",
+        "CMAKE_OBJECT_PATH_MAX": "200"
+      }
+    },    
+    {
+      "name": "vcpkg-android",
+      "generator": "Android Gradle",
+      "binaryDir": "${sourceDir}/build-android",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}\\scripts\\buildsystems\\vcpkg.cmake",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build-android/output",
+        "CMAKE_OBJECT_PATH_MAX": "200"
+      }
+    },
+    {
+      "name": "vcpkg-iphone",
+      "generator": "Xcode",
+      "binaryDir": "${sourceDir}/build-iphone",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}\\scripts\\buildsystems\\vcpkg.cmake",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build-iphone/output",
+        "CMAKE_OBJECT_PATH_MAX": "200"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vcpkg",
+      "configurePreset": "vcpkg",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "vcpkg-android",
+      "configurePreset": "vcpkg-android",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "vcpkg-iphone",
+      "configurePreset": "vcpkg-iphone",
+      "configuration": "RelWithDebInfo"
+    }
+  ]
+}

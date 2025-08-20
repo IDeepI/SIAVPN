@@ -1,0 +1,7 @@
+{
+    "version": 3,
+    "dependencies": [
+        "qt6-base",
+        "qt6-quick"
+    ]
+}

@@ -1,0 +1,13 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "cmake",
+			"label": "build",
+			"command": "build",
+			"group": "build",
+			"problemMatcher": ["$gcc"],
+			"detail": "Build SIAVPN using CMake"
+		}
+	]
+}

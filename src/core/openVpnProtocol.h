@@ -1,43 +1,68 @@
 #pragma once
 import std;
 #include "vpnProtocol.h"
-#include <openvpn/client/cliconnect.hpp>
+#include <openvpn/client/ovpncli.hpp>
+#include <openvpn/common/exception.hpp>
+#include <openvpn/common/cleanup.hpp>
 
 // Forward declarations
 namespace openvpn {
-    class ClientConnect;
+    namespace ClientAPI {
+        class OpenVPNClient;
+    }
 }
 
-class OpenVpnProtocol : public VpnProtocol {
+class OpenVpnProtocol : public VpnProtocol, public openvpn::ClientAPI::OpenVPNClient {
 public:
     OpenVpnProtocol();
     ~OpenVpnProtocol() override;
 
+    // VpnProtocol interface
     std::future<bool> connect(const std::string& configPath) override;
     void disconnect() override;
     VpnStatus status() const override;
     
-    // Call this when user chooses "Don't use VPN"
+    // OpenVPNClient callbacks - must be implemented
+    void event(const openvpn::ClientAPI::Event& ev) override;
+    void log(const openvpn::ClientAPI::LogInfo& log) override;
+    
+    // Additional control methods
+    void pause();
+    void resume();
+    void reconnect();
     void allowCommunicationWithoutVpn();
 
-    // Callback from OpenVPN3 client
-    void onConnectionStateChange(bool connected, const std::string& error = "");
-
 private:
-    std::atomic<VpnStatus> currentStatus{VpnStatus::Disconnected};
-    std::thread vpnThread;
-    std::unique_ptr<openvpn::ClientConnect> ovpnClient;
-    std::mutex clientMutex;
-    
-    // Private helper methods for connection management
+    // Connection management methods
     bool performConnection(const std::string& configPath);
-    std::optional<std::string> readConfigFile(const std::string& configPath);
-    bool initializeClient(const std::string& configContent);
-    openvpn::ClientConnect::Config createClientConfig(const std::string& configContent);
-    void setupEventCallbacks();
-    void handleClientEvent(const openvpn::ClientConnect::Event& event);
-    bool waitForConnection();
-    void startMonitoringThread();
-    void monitorConnection();
-    bool handleConnectionError(const std::string& errorMessage, VpnStatus status);
+    bool prepareConfiguration(const std::string& configPath);
+    bool initiateConnection();
+    void executeConnectionWorker();
+    bool waitForConnectionCompletion();
+    void cleanupFailedConnection();
+
+    // Configuration and helper methods
+    std::string readConfigFile(const std::string& configPath);
+    openvpn::ClientAPI::Config createConfig(const std::string& configContent);
+    
+    // Status and communication management
+    void updateStatus(VpnStatus newStatus, const std::string& message = "");
+    void blockCommunication();
+    void unblockCommunication();
+    void handleConnectionComplete(bool success, const std::string& error = "");
+    void secureCleanup();
+
+    // Member variables
+    VpnStatus currentStatus = VpnStatus::Disconnected;
+    std::string lastError;
+    std::atomic<bool> shouldStop{false};
+    std::atomic<bool> connectionInProgress{false};
+    std::atomic<bool> communicationBlocked{true};
+    
+    mutable std::mutex statusMutex;
+    std::condition_variable statusCv;
+    std::thread vpnThread;
+    
+    // Store current configuration for reuse
+    openvpn::ClientAPI::Config currentConfig;
 };

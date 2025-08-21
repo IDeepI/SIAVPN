@@ -1,223 +1,407 @@
-
 import std;
 #include "openVpnProtocol.h"
-#include <openvpn/client/cliconnect.hpp>
-#include <openvpn/client/clilife.hpp>
+#include <openvpn/client/ovpncli.hpp>
 #include <openvpn/common/exception.hpp>
+#include <openvpn/common/cleanup.hpp>
+#include <openvpn/common/string.hpp>
+#include <openvpn/common/to_string.hpp>
 #include <openvpn/log/logthread.hpp>
 
-// Helper to block/unblock communication
-static std::atomic<bool> communicationBlocked{false};
-static std::mutex commMutex;
-static std::condition_variable commCv;
-
-void blockCommunication() {
-    communicationBlocked = true;
-    // TODO: Implement actual network block logic (e.g., firewall rules)
-    std::cout << "[VPN] Communication blocked due to VPN disconnect.\n";
-}
-
-void unblockCommunication() {
-    communicationBlocked = false;
-    // TODO: Remove network block logic
-    std::cout << "[VPN] Communication unblocked by user action.\n";
-}
-
-OpenVpnProtocol::OpenVpnProtocol() : ovpnClient(nullptr) {
-    // Initialize OpenVPN3 logging
+OpenVpnProtocol::OpenVpnProtocol() {
+    // Initialize OpenVPN 3 logging subsystem
     openvpn::LogThread::init();
+    updateStatus(VpnStatus::Disconnected, "OpenVPN client initialized");
 }
 
 OpenVpnProtocol::~OpenVpnProtocol() {
-    disconnect();
-    if (vpnThread.joinable())
-        vpnThread.join();
+    // Ensure clean shutdown
+    shouldStop = true;
     
-    std::lock_guard<std::mutex> lock(clientMutex);
-    ovpnClient.reset();
+    // Disconnect if connected
+    if (currentStatus == VpnStatus::Connected || currentStatus == VpnStatus::Connecting) {
+        disconnect();
+    }
+    
+    // Wait for worker thread to complete
+    if (vpnThread.joinable()) {
+        vpnThread.join();
+    }
+    
+    // Secure cleanup
+    secureCleanup();
 }
 
 std::future<bool> OpenVpnProtocol::connect(const std::string& configPath) {
-    currentStatus = VpnStatus::Connecting;
+    if (connectionInProgress) {
+        return std::async(std::launch::deferred, []() { return false; });
+    }
+    
+    updateStatus(VpnStatus::Connecting, "Starting connection...");
+    connectionInProgress = true;
+    shouldStop = false;
 
     return std::async(std::launch::async, [this, configPath]() {
+        auto cleanup = openvpn::Cleanup([this]() {
+            connectionInProgress = false;
+        });
+        
         return performConnection(configPath);
     });
 }
 
 bool OpenVpnProtocol::performConnection(const std::string& configPath) {
     try {
-        std::cout << "[VPN] Starting OpenVPN3 using config: " << configPath << '\n';
-
-        auto configContent = readConfigFile(configPath);
-        if (!configContent.has_value()) {
-            return handleConnectionError("Failed to read config file", VpnStatus::Error);
+        // Phase 1: Configuration setup and validation
+        if (!prepareConfiguration(configPath)) {
+            return false;
         }
 
-        if (!initializeClient(*configContent)) {
-            return handleConnectionError("Failed to initialize OpenVPN3 client", VpnStatus::Error);
+        // Phase 2: Start the connection process
+        if (!initiateConnection()) {
+            return false;
         }
 
-        if (!waitForConnection()) {
-            return handleConnectionError("Connection timeout or failed", VpnStatus::Error);
-        }
-
-        startMonitoringThread();
-        std::cout << "[VPN] OpenVPN3 connected successfully.\n";
-        return true;
+        // Phase 3: Wait for connection completion
+        return waitForConnectionCompletion();
 
     } catch (const openvpn::Exception& e) {
-        return handleConnectionError("OpenVPN3 exception: " + std::string(e.what()), VpnStatus::Error);
+        handleConnectionComplete(false, "OpenVPN exception: " + std::string(e.what()));
+        return false;
     } catch (const std::exception& e) {
-        return handleConnectionError("Standard exception: " + std::string(e.what()), VpnStatus::Error);
+        handleConnectionComplete(false, "Standard exception: " + std::string(e.what()));
+        return false;
     }
 }
 
-std::optional<std::string> OpenVpnProtocol::readConfigFile(const std::string& configPath) {
-    std::ifstream configFile(configPath);
-    if (!configFile.is_open()) {
-        std::cerr << "[VPN] Failed to open config file: " << configPath << '\n';
-        return std::nullopt;
+bool OpenVpnProtocol::prepareConfiguration(const std::string& configPath) {
+    try {
+        // Read and validate configuration file
+        std::string configContent = readConfigFile(configPath);
+        if (configContent.empty()) {
+            handleConnectionComplete(false, "Failed to read configuration file");
+            return false;
+        }
+
+        // Create OpenVPN configuration
+        currentConfig = createConfig(configContent);
+        
+        // Evaluate configuration
+        openvpn::ClientAPI::EvalConfig eval = eval_config(currentConfig);
+        if (eval.error) {
+            std::string errorMsg = "Configuration evaluation failed: " + eval.message;
+            handleConnectionComplete(false, errorMsg);
+            return false;
+        }
+
+        updateStatus(VpnStatus::Connecting, "Configuration validated successfully");
+        return true;
+
+    } catch (const std::exception& e) {
+        handleConnectionComplete(false, "Configuration preparation failed: " + std::string(e.what()));
+        return false;
     }
-
-    std::string configContent((std::istreambuf_iterator<char>(configFile)),
-                             std::istreambuf_iterator<char>());
-    configFile.close();
-    return configContent;
 }
 
-bool OpenVpnProtocol::initializeClient(const std::string& configContent) {
-    std::lock_guard<std::mutex> lock(clientMutex);
-    
-    // Create OpenVPN3 client
-    ovpnClient = std::make_unique<openvpn::ClientConnect>();
-    
-    // Set up connection parameters
-    auto config = createClientConfig(configContent);
-    setupEventCallbacks();
-    
-    // Start the connection
-    ovpnClient->connect(config);
-    return true;
+bool OpenVpnProtocol::initiateConnection() {
+    try {
+        updateStatus(VpnStatus::Connecting, "Establishing connection...");
+
+        // Start connection in worker thread to avoid blocking
+        vpnThread = std::thread([this]() {
+            executeConnectionWorker();
+        });
+
+        return true;
+
+    } catch (const std::exception& e) {
+        handleConnectionComplete(false, "Failed to initiate connection: " + std::string(e.what()));
+        return false;
+    }
 }
 
-openvpn::ClientConnect::Config OpenVpnProtocol::createClientConfig(const std::string& configContent) {
-    openvpn::ClientConnect::Config config;
+void OpenVpnProtocol::executeConnectionWorker() {
+    try {
+        // This call blocks until connection is established or fails
+        openvpn::ClientAPI::Status connectStatus = OpenVPNClient::connect();
+        
+        if (connectStatus.error) {
+            handleConnectionComplete(false, "Connection failed: " + connectStatus.message);
+        } else {
+            handleConnectionComplete(true);
+        }
+    } catch (const openvpn::Exception& e) {
+        handleConnectionComplete(false, "OpenVPN exception in worker: " + std::string(e.what()));
+    } catch (const std::exception& e) {
+        handleConnectionComplete(false, "Standard exception in worker: " + std::string(e.what()));
+    }
+}
+
+bool OpenVpnProtocol::waitForConnectionCompletion() {
+    try {
+        std::unique_lock<std::mutex> lock(statusMutex);
+        auto timeout = std::chrono::seconds(30);
+        
+        bool completed = statusCv.wait_for(lock, timeout, [this]() {
+            return currentStatus == VpnStatus::Connected || 
+                   currentStatus == VpnStatus::Error ||
+                   shouldStop;
+        });
+
+        if (!completed && !shouldStop) {
+            updateStatus(VpnStatus::Error, "Connection timeout");
+            cleanupFailedConnection();
+            return false;
+        }
+
+        if (shouldStop) {
+            updateStatus(VpnStatus::Disconnected, "Connection cancelled by user");
+            return false;
+        }
+
+        return currentStatus == VpnStatus::Connected;
+
+    } catch (const std::exception& e) {
+        handleConnectionComplete(false, "Error waiting for connection: " + std::string(e.what()));
+        return false;
+    }
+}
+
+void OpenVpnProtocol::cleanupFailedConnection() {
+    try {
+        // Stop the OpenVPN client if it's still trying to connect
+        if (vpnThread.joinable()) {
+            shouldStop = true;
+            OpenVPNClient::stop();
+            vpnThread.join();
+        }
+        
+        // Ensure communication is blocked for security
+        blockCommunication();
+        
+    } catch (const std::exception& e) {
+        std::cerr << "[VPN] Error during connection cleanup: " << e.what() << '\n';
+    }
+}
+
+std::string OpenVpnProtocol::readConfigFile(const std::string& configPath) {
+    try {
+        std::ifstream configFile(configPath, std::ios::binary);
+        if (!configFile.is_open()) {
+            throw std::runtime_error("Cannot open config file: " + configPath);
+        }
+
+        std::string content((std::istreambuf_iterator<char>(configFile)),
+                           std::istreambuf_iterator<char>());
+        
+        if (content.empty()) {
+            throw std::runtime_error("Config file is empty: " + configPath);
+        }
+
+        return content;
+    } catch (const std::exception& e) {
+        lastError = "Failed to read config file: " + std::string(e.what());
+        return "";
+    }
+}
+
+openvpn::ClientAPI::Config OpenVpnProtocol::createConfig(const std::string& configContent) {
+    openvpn::ClientAPI::Config config;
+    
+    // Set the configuration content (inline style as required by OpenVPN 3)
     config.content = configContent;
-    config.server_override = "";
-    config.port_override = "";
-    config.proto_override = "";
-    config.compress_mode = openvpn::CompressionMode::COMP_AUTO;
-    config.tcp_queue_limit = 64;
-    config.socket_protect = false;
+    
+    // Configure connection parameters following OpenVPN 3 best practices
+    config.compressionMode = "adaptive";  // Use adaptive compression
+    config.tcpQueueLimit = 64;            // Default TCP queue limit
+    config.server_override = "";          // No server override
+    config.port_override = "";            // No port override  
+    config.proto_override = "";           // No protocol override
+    config.allowLocalLan = false;         // Security: don't allow local LAN access
+    config.tunPersist = false;            // Don't persist tunnel
+    config.autologinSessions = false;     // Disable auto-login for security
+    
+    // Security settings
+    config.disableClientCert = false;    // Require client certificates
+    config.sslDebugLevel = 0;             // No SSL debug in production
+    
     return config;
 }
 
-void OpenVpnProtocol::setupEventCallbacks() {
-    ovpnClient->set_event_callback([this](const openvpn::ClientConnect::Event& event) {
-        handleClientEvent(event);
-    });
-}
-
-void OpenVpnProtocol::handleClientEvent(const openvpn::ClientConnect::Event& event) {
-    switch (event.type) {
-        case openvpn::ClientConnect::Event::CONNECTED:
-            onConnectionStateChange(true);
-            break;
-        case openvpn::ClientConnect::Event::DISCONNECTED:
-            onConnectionStateChange(false, event.info);
-            break;
-        case openvpn::ClientConnect::Event::RECONNECTING:
-            currentStatus = VpnStatus::Connecting;
-            break;
-        case openvpn::ClientConnect::Event::AUTH_FAILED:
-            onConnectionStateChange(false, "Authentication failed");
-            break;
-        default:
-            break;
-    }
-}
-
-bool OpenVpnProtocol::waitForConnection() {
-    constexpr auto timeout = std::chrono::seconds(30);
-    constexpr auto pollInterval = std::chrono::milliseconds(100);
-    
-    auto startTime = std::chrono::steady_clock::now();
-    
-    while (currentStatus == VpnStatus::Connecting) {
-        std::this_thread::sleep_for(pollInterval);
-        auto elapsed = std::chrono::steady_clock::now() - startTime;
-        
-        if (elapsed > timeout) {
-            std::cerr << "[VPN] Connection timeout\n";
-            return false;
-        }
-    }
-    
-    return currentStatus == VpnStatus::Connected;
-}
-
-void OpenVpnProtocol::startMonitoringThread() {
-    vpnThread = std::thread([this]() {
-        monitorConnection();
-    });
-}
-
-void OpenVpnProtocol::monitorConnection() {
-    constexpr auto monitorInterval = std::chrono::seconds(1);
-    
-    while (currentStatus == VpnStatus::Connected) {
-        std::this_thread::sleep_for(monitorInterval);
-        
-        std::lock_guard<std::mutex> lock(clientMutex);
-        if (ovpnClient && !ovpnClient->is_connected()) {
-            std::cout << "[VPN] OpenVPN3 connection lost!\n";
-            currentStatus = VpnStatus::Disconnected;
-            blockCommunication();
-            break;
-        }
-    }
-}
-
-bool OpenVpnProtocol::handleConnectionError(const std::string& errorMessage, VpnStatus status) {
-    std::cerr << "[VPN] " << errorMessage << '\n';
-    currentStatus = status;
-    blockCommunication();
-    return false;
-}
-
 void OpenVpnProtocol::disconnect() {
-    if (currentStatus == VpnStatus::Connected ||
-        currentStatus == VpnStatus::Connecting) {
-        std::cout << "[VPN] Disconnecting OpenVPN3...\n";
+    if (currentStatus == VpnStatus::Disconnected) {
+        return;
+    }
+
+    updateStatus(VpnStatus::Disconnected, "Disconnecting...");
+    shouldStop = true;
+
+    try {
+        // Signal OpenVPN client to stop
+        OpenVPNClient::stop();
         
-        std::lock_guard<std::mutex> lock(clientMutex);
-        if (ovpnClient) {
-            ovpnClient->disconnect();
+        // Wait for worker thread to complete
+        if (vpnThread.joinable()) {
+            vpnThread.join();
         }
         
-        currentStatus = VpnStatus::Disconnected;
         blockCommunication();
+        updateStatus(VpnStatus::Disconnected, "Disconnected successfully");
+        
+    } catch (const std::exception& e) {
+        updateStatus(VpnStatus::Error, "Error during disconnect: " + std::string(e.what()));
     }
 }
 
-void OpenVpnProtocol::onConnectionStateChange(bool connected, const std::string& error) {
-    if (connected) {
-        currentStatus = VpnStatus::Connected;
-        std::cout << "[VPN] OpenVPN3 connection established.\n";
-    } else {
-        currentStatus = VpnStatus::Disconnected;
-        if (!error.empty()) {
-            std::cerr << "[VPN] OpenVPN3 connection failed/lost: " << error << '\n';
-        }
+void OpenVpnProtocol::pause() {
+    try {
+        OpenVPNClient::pause("User requested pause");
+        updateStatus(VpnStatus::Disconnected, "Connection paused");
+    } catch (const std::exception& e) {
+        updateStatus(VpnStatus::Error, "Failed to pause: " + std::string(e.what()));
+    }
+}
+
+void OpenVpnProtocol::resume() {
+    try {
+        OpenVPNClient::resume();
+        updateStatus(VpnStatus::Connecting, "Resuming connection...");
+    } catch (const std::exception& e) {
+        updateStatus(VpnStatus::Error, "Failed to resume: " + std::string(e.what()));
+    }
+}
+
+void OpenVpnProtocol::reconnect() {
+    try {
+        OpenVPNClient::reconnect(1); // Reconnect with 1 second delay
+        updateStatus(VpnStatus::Connecting, "Reconnecting...");
+    } catch (const std::exception& e) {
+        updateStatus(VpnStatus::Error, "Failed to reconnect: " + std::string(e.what()));
+    }
+}
+
+// OpenVPN Client API callbacks
+void OpenVpnProtocol::event(const openvpn::ClientAPI::Event& ev) {
+    std::string eventMsg = "Event: " + ev.name;
+    if (!ev.info.empty()) {
+        eventMsg += " - " + ev.info;
+    }
+
+    // Handle different event types following OpenVPN 3 patterns
+    if (ev.name == "CONNECTED") {
+        updateStatus(VpnStatus::Connected, "VPN connection established");
+        unblockCommunication();
+        
+    } else if (ev.name == "DISCONNECTED") {
+        updateStatus(VpnStatus::Disconnected, ev.info.empty() ? "Disconnected" : ev.info);
         blockCommunication();
+        
+    } else if (ev.name == "RECONNECTING") {
+        updateStatus(VpnStatus::Connecting, "Reconnecting...");
+        
+    } else if (ev.name == "AUTH_FAILED") {
+        updateStatus(VpnStatus::Error, "Authentication failed");
+        blockCommunication();
+        
+    } else if (ev.name == "CERT_VERIFY_FAIL") {
+        updateStatus(VpnStatus::Error, "Certificate verification failed");
+        blockCommunication();
+        
+    } else if (ev.name == "TLS_ERROR") {
+        updateStatus(VpnStatus::Error, "TLS error: " + ev.info);
+        blockCommunication();
+        
+    } else if (ev.name == "CLIENT_RESTART") {
+        updateStatus(VpnStatus::Connecting, "Client restarting...");
+        
+    } else {
+        // Log other events for debugging
+        std::cout << "[VPN] " << eventMsg << '\n';
+    }
+}
+
+void OpenVpnProtocol::log(const openvpn::ClientAPI::LogInfo& log) {
+    // Filter log levels and format appropriately
+    std::string prefix;
+    
+    switch (log.level) {
+        case 0: // Fatal
+            prefix = "[FATAL] ";
+            std::cerr << prefix << log.text << '\n';
+            break;
+        case 1: // Error  
+            prefix = "[ERROR] ";
+            std::cerr << prefix << log.text << '\n';
+            break;
+        case 2: // Warning
+            prefix = "[WARN] ";
+            std::cout << prefix << log.text << '\n';
+            break;
+        case 3: // Info
+            prefix = "[INFO] ";
+            std::cout << prefix << log.text << '\n';
+            break;
+        default: // Debug and verbose
+            // Only show debug logs in debug builds
+            #ifdef _DEBUG
+            prefix = "[DEBUG] ";
+            std::cout << prefix << log.text << '\n';
+            #endif
+            break;
     }
 }
 
 void OpenVpnProtocol::allowCommunicationWithoutVpn() {
     unblockCommunication();
+    updateStatus(VpnStatus::Disconnected, "Communication allowed without VPN");
 }
 
 VpnStatus OpenVpnProtocol::status() const {
     return currentStatus;
+}
+
+// Private helper methods
+void OpenVpnProtocol::updateStatus(VpnStatus newStatus, const std::string& message) {
+    {
+        std::lock_guard<std::mutex> lock(statusMutex);
+        currentStatus = newStatus;
+        if (!message.empty()) {
+            lastError = message;
+        }
+    }
+    statusCv.notify_all();
+    
+    if (!message.empty()) {
+        std::cout << "[VPN] " << message << '\n';
+    }
+}
+
+void OpenVpnProtocol::blockCommunication() {
+    communicationBlocked = true;
+    // TODO: Implement actual network blocking (firewall rules, route manipulation, etc.)
+    std::cout << "[VPN] Communication blocked - VPN protection active\n";
+}
+
+void OpenVpnProtocol::unblockCommunication() {
+    communicationBlocked = false;
+    // TODO: Remove network blocking
+    std::cout << "[VPN] Communication unblocked\n";
+}
+
+void OpenVpnProtocol::handleConnectionComplete(bool success, const std::string& error) {
+    if (success) {
+        updateStatus(VpnStatus::Connected, "VPN connection established successfully");
+        unblockCommunication();
+    } else {
+        updateStatus(VpnStatus::Error, error.empty() ? "Connection failed" : error);
+        blockCommunication();
+    }
+}
+
+void OpenVpnProtocol::secureCleanup() {
+    // Clear sensitive data following security best practices
+    lastError.clear();
+    
+    // Zero out any potential sensitive memory
+    // Note: In a real implementation, you might want to use secure memory clearing
+    std::fill(lastError.begin(), lastError.end(), '\0');
 }

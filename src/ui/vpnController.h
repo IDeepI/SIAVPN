@@ -1,6 +1,7 @@
 #pragma once
+import std;
 #include <QObject>
-#include "openVpnProtocol.h"
+#include "../core/openVpnProtocol.h"
 
 class VpnController : public QObject {
     Q_OBJECT
@@ -11,6 +12,7 @@ public:
 
     Q_INVOKABLE void connectVpn(const QString& configPath);
     Q_INVOKABLE void disconnectVpn();
+    Q_INVOKABLE void allowCommunicationWithoutVpn();
     QString status() const;
 
 signals:

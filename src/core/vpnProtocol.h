@@ -1,6 +1,5 @@
 #pragma once
-#include <string>
-#include <future>
+import std;
 
 enum class VpnStatus { Disconnected, Connecting, Connected, Error };
 

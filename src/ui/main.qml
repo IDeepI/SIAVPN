@@ -27,5 +27,10 @@ ApplicationWindow {
             text: "Disconnect"
             onClicked: vpnController.disconnectVpn()
         }
+
+        Button {
+            text: "Allow communication without vpn"
+            onClicked: vpnController.allowCommunicationWithoutVpn()
+        }
     }
 }

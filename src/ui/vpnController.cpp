@@ -1,3 +1,4 @@
+import std;
 #include "vpnController.h"
 
 VpnController::VpnController(QObject* parent) : QObject(parent) {}
@@ -11,6 +12,11 @@ void VpnController::connectVpn(const QString& configPath) {
 
 void VpnController::disconnectVpn() {
     vpn.disconnect();
+    emit statusChanged();
+}
+
+void VpnController::allowCommunicationWithoutVpn() {
+    vpn.allowCommunicationWithoutVpn();
     emit statusChanged();
 }
 

@@ -9,29 +9,43 @@ set(CMAKE_AUTORCC OFF)
 set(CMAKE_AUTOUIC OFF)
 
 find_package(Qt6 COMPONENTS Quick REQUIRED)
-find_package(openvpn3 REQUIRED)
 if(NOT Qt6_FOUND)
     message(FATAL_ERROR "Qt6 not found. Please install Qt6.")
 endif()
 
-if(NOT openvpn3_FOUND)
-    message(FATAL_ERROR "OpenVPN 3 not found. Please install OpenVPN 3.")
-endif()
-
-file(GLOB SRC_FILES
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/core/*.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/ui/*.cpp
+# Explicitly list source files for better control
+set(CORE_SRC_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core/openVpnProtocol.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core/vpnConnectionManager.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core/vpnConfigManager.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core/vpnSecurityManager.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core/openVpnClient.cpp
 )
 
-add_executable(${PROJECT_NAME} ${SRC_FILES} ${CMAKE_CURRENT_SOURCE_DIR}/src/ui/main.qml)
+set(UI_SRC_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ui/vpnController.cpp
+)
 
-target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+set(MAIN_SRC_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp
+)
+
+add_executable(${PROJECT_NAME} 
+    ${MAIN_SRC_FILES}
+    ${CORE_SRC_FILES}
+    ${UI_SRC_FILES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ui/main.qml
+)
+
+target_include_directories(${PROJECT_NAME} PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ui
+)
 
 target_link_libraries(${PROJECT_NAME}
     Qt6::Core
     Qt6::Quick
-    openvpn3::openvpn3
 )
 
 # Set output directory

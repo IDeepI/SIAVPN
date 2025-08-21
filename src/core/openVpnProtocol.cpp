@@ -1,16 +1,113 @@
 import std;
 #include "openVpnProtocol.h"
-#include <openvpn/client/ovpncli.hpp>
-#include <openvpn/common/exception.hpp>
-#include <openvpn/common/cleanup.hpp>
-#include <openvpn/common/string.hpp>
-#include <openvpn/common/to_string.hpp>
-#include <openvpn/log/logthread.hpp>
+#include "vpnConnectionManager.h"
+#include "vpnSecurityManager.h"
 
-OpenVpnProtocol::OpenVpnProtocol() {
-    // Initialize OpenVPN 3 logging subsystem
-    openvpn::LogThread::init();
-    updateStatus(VpnStatus::Disconnected, "OpenVPN client initialized");
+OpenVpnProtocol::OpenVpnProtocol() 
+    : connectionManager(std::make_unique<VpnConnectionManager>())
+    , securityManager(std::make_unique<VpnSecurityManager>()) {
+    
+    // Set up status change callback
+    connectionManager->setStatusCallback([this](VpnStatus status, const std::string& message) {
+        onStatusChanged(status, message);
+    });
+    
+    std::cout << "[VPN] OpenVPN protocol initialized with modular components\n";
+}
+
+OpenVpnProtocol::~OpenVpnProtocol() {
+    // Ensure clean shutdown through the connection manager
+    if (connectionManager) {
+        connectionManager->disconnect();
+    }
+    
+    // Secure cleanup through security manager
+    if (securityManager) {
+        securityManager->secureCleanup();
+    }
+}
+
+std::future<bool> OpenVpnProtocol::connect(const std::string& configPath) {
+    if (!connectionManager) {
+        return std::async(std::launch::deferred, []() { return false; });
+    }
+    
+    // Ensure communication is blocked during connection attempt
+    securityManager->blockCommunication();
+    
+    return connectionManager->connect(configPath);
+}
+
+void OpenVpnProtocol::disconnect() {
+    if (connectionManager) {
+        connectionManager->disconnect();
+    }
+    
+    // Block communication for security
+    if (securityManager) {
+        securityManager->blockCommunication();
+    }
+}
+
+VpnStatus OpenVpnProtocol::status() const {
+    if (connectionManager) {
+        return connectionManager->getCurrentStatus();
+    }
+    return VpnStatus::Error;
+}
+
+void OpenVpnProtocol::pause() {
+    if (connectionManager) {
+        connectionManager->pause();
+    }
+}
+
+void OpenVpnProtocol::resume() {
+    if (connectionManager) {
+        connectionManager->resume();
+    }
+}
+
+void OpenVpnProtocol::reconnect() {
+    if (connectionManager) {
+        connectionManager->reconnect();
+    }
+}
+
+void OpenVpnProtocol::allowCommunicationWithoutVpn() {
+    if (securityManager) {
+        securityManager->allowCommunicationWithoutVpn();
+    }
+}
+
+void OpenVpnProtocol::onStatusChanged(VpnStatus status, const std::string& message) {
+    // Handle status changes and update security accordingly
+    switch (status) {
+        case VpnStatus::Connected:
+            if (securityManager) {
+                securityManager->unblockCommunication();
+            }
+            std::cout << "[VPN] Status: Connected - " << message << '\n';
+            break;
+            
+        case VpnStatus::Disconnected:
+            if (securityManager) {
+                securityManager->blockCommunication();
+            }
+            std::cout << "[VPN] Status: Disconnected - " << message << '\n';
+            break;
+            
+        case VpnStatus::Connecting:
+            std::cout << "[VPN] Status: Connecting - " << message << '\n';
+            break;
+            
+        case VpnStatus::Error:
+            if (securityManager) {
+                securityManager->blockCommunication();
+            }
+            std::cerr << "[VPN] Status: Error - " << message << '\n';
+            break;
+    }
 }
 
 OpenVpnProtocol::~OpenVpnProtocol() {
